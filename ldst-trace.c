@@ -47,8 +47,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 static CPU *cpus;
 static int cpu_len;
 
-static uint64_t logical_clock;
-static uint64_t *insn_count;
+static struct qemu_plugin_scoreboard *insn_count_score;
+static qemu_plugin_u64 insn_count_entry;
 
 static inline void log_write(LogRecord *value, int cpu) {
   fwrite(value, sizeof(LogRecord), 1, cpus[cpu].logfile);
@@ -60,7 +60,6 @@ static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     return;
   }
   LogRecord record;
-
   if (qemu_plugin_mem_is_store(info)) {
     record.store = 1;
   } else {
@@ -74,29 +73,23 @@ static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
   record.address = addr;
   record.cpu = cpu_index;
   record.access_size = qemu_plugin_mem_size_shift(info);
-  record.logical_clock = __atomic_load_n(&logical_clock, __ATOMIC_SEQ_CST);
-  record.insn_count = insn_count[cpu_index];
+  record.logical_clock = qemu_plugin_u64_sum(insn_count_entry);
+  uint64_t *val = qemu_plugin_scoreboard_find(insn_count_score, cpu_index);
+  record.insn_count = *val;
   log_write(&record, cpu_index);
 }
 
-static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
-  if (!qemu_plugin_log_is_enabled()) {
-    return;
-  }
-  ++insn_count[cpu_index];
-  __atomic_fetch_add(&logical_clock, 1, __ATOMIC_SEQ_CST);
-}
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
   struct qemu_plugin_insn *insn;
-
   size_t n_insns = qemu_plugin_tb_n_insns(tb);
+
   for (size_t i = 0; i < n_insns; i++) {
     insn = qemu_plugin_tb_get_insn(tb, i);
     qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem, QEMU_PLUGIN_CB_NO_REGS,
                                      QEMU_PLUGIN_MEM_RW, NULL);
-    qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec,
-                                           QEMU_PLUGIN_CB_NO_REGS, NULL);
+    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(insn,
+      QEMU_PLUGIN_INLINE_ADD_U64,insn_count_entry,1);
   }
 }
 
@@ -120,14 +113,18 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
   cpus[vcpu_index].logfile = fopen(filename, "wb");
 }
 
-static void plugin_exit(qemu_plugin_id_t id, void *p) { close_logfiles(); }
+static void plugin_exit(qemu_plugin_id_t id, void *p) { 
+  close_logfiles();
+  qemu_plugin_scoreboard_free(insn_count_score);
+}
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                            const qemu_info_t *info, int argc,
                                            char **argv) {
   cpu_len = info->system.max_vcpus;
   cpus = malloc(cpu_len * sizeof(CPU));
-  insn_count = calloc(cpu_len, sizeof(uint64_t));
+  insn_count_score = qemu_plugin_scoreboard_new(sizeof(uint64_t));
+  insn_count_entry = qemu_plugin_scoreboard_u64(insn_count_score);
 
   /* Register init, translation block and exit callbacks */
   qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
