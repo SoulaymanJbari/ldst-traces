@@ -25,6 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include <qemu-plugin.h>
 
@@ -37,9 +40,12 @@ typedef struct LogRecord {
   uint64_t address;
 } LogRecord;
 
+#define MAX_BUFFER_SIZE 1000000
+
 typedef struct CPU {
-  FILE *logfile;
-  LogRecord record;
+  uint64_t head;
+  uint64_t tail;
+  LogRecord logRecord[MAX_BUFFER_SIZE];
 } CPU;
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -50,33 +56,30 @@ static int cpu_len;
 static struct qemu_plugin_scoreboard *insn_count_score;
 static qemu_plugin_u64 insn_count_entry;
 
-static inline void log_write(LogRecord *value, int cpu) {
-  fwrite(value, sizeof(LogRecord), 1, cpus[cpu].logfile);
-}
 
 static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
                      uint64_t vaddr, void *udata) {
   if (!qemu_plugin_log_is_enabled()) {
     return;
   }
-  LogRecord record;
-  if (qemu_plugin_mem_is_store(info)) {
-    record.store = 1;
-  } else {
-    record.store = 0;
-  }
   struct qemu_plugin_hwaddr *hwaddr = qemu_plugin_get_hwaddr(info, vaddr);
   if (qemu_plugin_hwaddr_is_io(hwaddr)) {
     return;
   }
+  uint64_t index = __atomic_fetch_add(&cpus[cpu_index].head,1,__ATOMIC_SEQ_CST);
+  uint64_t real_index = index % MAX_BUFFER_SIZE;
+  if (qemu_plugin_mem_is_store(info)) {
+    cpus[cpu_index].logRecord[real_index].store = 1;
+  } else {
+    cpus[cpu_index].logRecord[real_index].store = 0;
+  }
   uint64_t addr = qemu_plugin_hwaddr_phys_addr(hwaddr);
-  record.address = addr;
-  record.cpu = cpu_index;
-  record.access_size = qemu_plugin_mem_size_shift(info);
-  record.logical_clock = qemu_plugin_u64_sum(insn_count_entry);
+  cpus[cpu_index].logRecord[real_index].address = addr;
+  cpus[cpu_index].logRecord[real_index].cpu = cpu_index;
+  cpus[cpu_index].logRecord[real_index].access_size = qemu_plugin_mem_size_shift(info);
+  cpus[cpu_index].logRecord[real_index].logical_clock = qemu_plugin_u64_sum(insn_count_entry);
   uint64_t *val = qemu_plugin_scoreboard_find(insn_count_score, cpu_index);
-  record.insn_count = *val;
-  log_write(&record, cpu_index);
+  cpus[cpu_index].logRecord[real_index].insn_count = *val;
 }
 
 
@@ -93,36 +96,28 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
   }
 }
 
-QEMU_PLUGIN_EXPORT void close_logfiles(void) {
-  for (int i = 0; i < cpu_len; ++i) {
-    fclose(cpus[i].logfile);
-  }
-}
-
-QEMU_PLUGIN_EXPORT void open_logfiles(void) {
-  char filename[32];
-  for (int i = 0; i < cpu_len; ++i) {
-    snprintf(filename, 32, "log.txt.%d", i);
-    cpus[i].logfile = fopen(filename, "wb");
-  }
-}
-
 static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
-  char filename[32];
-  snprintf(filename, 32, "log.txt.%d", vcpu_index);
-  cpus[vcpu_index].logfile = fopen(filename, "wb");
+
 }
 
 static void plugin_exit(qemu_plugin_id_t id, void *p) { 
-  close_logfiles();
   qemu_plugin_scoreboard_free(insn_count_score);
+  munmap(cpus, cpu_len * sizeof(CPU));
 }
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                            const qemu_info_t *info, int argc,
                                            char **argv) {
   cpu_len = info->system.max_vcpus;
-  cpus = malloc(cpu_len * sizeof(CPU));
+  uint64_t total_size = cpu_len * sizeof(CPU);
+  int fd = shm_open("/qemu_trace", O_CREAT | O_RDWR | O_TRUNC, 0666);
+  if (ftruncate(fd, total_size) == -1) {
+    perror("ftruncate");
+    close(fd);
+    return -1; 
+  }
+  cpus = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  memset(cpus, 0, total_size);
   insn_count_score = qemu_plugin_scoreboard_new(sizeof(uint64_t));
   insn_count_entry = qemu_plugin_scoreboard_u64(insn_count_score);
 
