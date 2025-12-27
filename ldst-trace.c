@@ -40,7 +40,7 @@ typedef struct LogRecord {
   uint64_t address;
 } LogRecord;
 
-#define MAX_BUFFER_SIZE 1000000
+#define MAX_BUFFER_SIZE 50000000
 
 typedef struct CPU {
   uint64_t head;
