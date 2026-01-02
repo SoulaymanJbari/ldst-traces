@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +7,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <stdbool.h>
 
@@ -19,7 +21,7 @@ typedef struct LogRecord {
 } LogRecord;
 
 #define MAX_BUFFER_SIZE 50000000
-#define CHUNK_TRESHOLD  10000000
+#define CHUNK_TRESHOLD  1048576 //32 Mo
 
 typedef struct CPU {
   uint64_t head;
@@ -41,6 +43,7 @@ void handle_signals(int sig) {
 
 int main(int argc, char** argv){
     int nb_error = 0;
+    int ret = 0;
     if (argc != 2){
         printf("Il faut préciser le nombre de cpus qui tournent");
         return -1;
@@ -67,28 +70,41 @@ int main(int argc, char** argv){
         exit(1);
     }
     while (!stopping){
+        bool has_work = false;
         for (int i=0; i< cpu_len; i++){
             uint64_t current_head = __atomic_load_n(&cpus[i].head, __ATOMIC_RELAXED);
             uint64_t current_tail = __atomic_load_n(&cpus[i].tail, __ATOMIC_RELAXED);
             uint64_t size = current_head - current_tail;
             if (size > MAX_BUFFER_SIZE){
-                printf("Erreur dans l'écriture, écrasement de données\n");
                 nb_error++;
                 __atomic_store_n(&cpus[i].tail, current_head -1, __ATOMIC_RELEASE);
+                has_work = true;
                 continue;
             }
             if (size > CHUNK_TRESHOLD){
-                uint64_t real_head = current_head % MAX_BUFFER_SIZE;
                 uint64_t real_tail = current_tail % MAX_BUFFER_SIZE;
+                uint64_t real_head = current_head % MAX_BUFFER_SIZE;
                 if (real_tail < real_head){
-                    write(logfds[i], &cpus[i].logRecord[real_tail], sizeof(LogRecord) * size);
+                    ret = write(logfds[i], &cpus[i].logRecord[real_tail], sizeof(LogRecord) * size);
                 } else {
-                    write(logfds[i], &cpus[i].logRecord[real_tail], sizeof(LogRecord) * (MAX_BUFFER_SIZE - real_tail));
-                    write(logfds[i], &cpus[i].logRecord[0], sizeof(LogRecord) * (size - (MAX_BUFFER_SIZE - real_tail)));
+                    struct iovec iov[2];
+                    uint64_t first_part_count = MAX_BUFFER_SIZE - real_tail;
+
+                    iov[0].iov_base = &cpus[i].logRecord[real_tail];
+                    iov[0].iov_len = first_part_count * sizeof(LogRecord);
+
+                    iov[1].iov_base = &cpus[i].logRecord[0];
+                    iov[1].iov_len = (size - first_part_count) * sizeof(LogRecord);
+
+                    ret = writev(logfds[i], iov, 2);
                 }
 
-                __atomic_fetch_add(&cpus[i].tail, size, __ATOMIC_SEQ_CST);
+                __atomic_fetch_add(&cpus[i].tail, size, __ATOMIC_RELEASE);
+                has_work = true;
             }
+        }
+        if (!has_work) {
+            usleep(100000);
         }
 
     }
